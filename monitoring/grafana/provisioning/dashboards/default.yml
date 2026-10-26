@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: 'AMD Mission Control'
+    orgId: 1
+    folder: 'AMD AI Factory'
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards

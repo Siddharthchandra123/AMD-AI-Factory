@@ -1,0 +1,96 @@
+name: amd-ai-factory
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mission
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mission_local_only}
+      POSTGRES_DB: mission
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mission -d mission"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redisdata:/data
+    networks: [internal]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://mission:${POSTGRES_PASSWORD:-mission_local_only}@postgres:5432/mission
+      REDIS_URL: redis://redis:6379/0
+      SIM_GPU_COUNT: ${SIM_GPU_COUNT:-4}
+      MI300X_AGENT_URLS: ${MI300X_AGENT_URLS:-}
+      MISSION_AGENT_TOKEN: ${MISSION_AGENT_TOKEN:-}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [internal]
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on: [backend]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    networks: [internal]
+
+  prometheus:
+    image: prom/prometheus:v3.3.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    depends_on: [backend]
+    networks: [internal]
+
+  grafana:
+    image: grafana/grafana-oss:11.6.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local_grafana_demo}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3001:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on: [prometheus]
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
+volumes:
+  pgdata:
+  redisdata:
+  promdata:
+  grafanadata:

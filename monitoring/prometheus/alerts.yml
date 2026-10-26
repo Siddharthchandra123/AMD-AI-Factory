@@ -1,0 +1,19 @@
+groups:
+  - name: simulated-gpu-rules
+    rules:
+      - alert: VirtualGPUHighUtilization
+        expr: mission_gpu_utilization_percent{source="simulation"} > 90
+        for: 1m
+        labels:
+          severity: warning
+          data_source: simulation
+        annotations:
+          summary: "Simulated GPU {{ $labels.gpu_id }} utilization above 90%"
+      - alert: SimulatedQueueBacklog
+        expr: mission_pending_jobs > 12
+        for: 1m
+        labels:
+          severity: warning
+          data_source: simulation
+        annotations:
+          summary: "Simulation queue has over 12 jobs"
