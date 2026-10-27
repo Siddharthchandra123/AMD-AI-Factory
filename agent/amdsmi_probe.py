@@ -47,8 +47,8 @@ def probe_gpus() -> list[dict[str, Any]]:
             result.append({
                 'id': str(idx),
                 'model': str(asic.get('market_name') or asic.get('asic_name') or 'AMD GPU'),
-                'memory_total_gb': round(total / 2**30, 3) if total is not None else None,
-                'memory_used_gb': round(used / 2**30, 3) if used is not None else None,
+                'memory_total_gb': round(total / 1024, 3) if total is not None else None,
+                'memory_used_gb': round(used / 1024, 3) if used is not None else None,
                 'utilization_percent': util,
                 'temperature_c': temp,
                 'power_watts': watts,
