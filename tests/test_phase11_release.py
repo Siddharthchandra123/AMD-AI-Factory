@@ -33,7 +33,7 @@ class Phase11ReleaseTests(unittest.TestCase):
     def add(self, name, content):
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding='utf8')
+        path.write_bytes(content.encode("utf-8"))
 
     def test_no_sensitive_filenames_packaged(self):
         outfile = self.root / 'dist' / 'candidate.zip'

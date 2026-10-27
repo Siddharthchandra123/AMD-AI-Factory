@@ -105,6 +105,25 @@ class InstallerTests(unittest.TestCase):
             dest=tmp/rel
             dest.parent.mkdir(parents=True,exist_ok=True)
             shutil.copy2(src/rel,dest)
+        # Test-fixture normalization: start before Scheduler Lab install.
+        # The developer's source project may *already* have this feature installed.
+        # Strip only the installed markers from copied temporary fixtures,
+        # so the installer is actually tested in an uninstalled state.
+        compose_file = tmp / 'docker-compose.yml'
+        compose_content = compose_file.read_text(encoding='utf-8')
+        compose_content = ''.join(
+            line for line in compose_content.splitlines(keepends=True)
+            if 'SCHEDULER_LAB_RESULTS_DIR' not in line
+            and './results/scheduler-lab:/app/scheduler-lab-evidence:ro' not in line
+        )
+        compose_file.write_text(compose_content, encoding='utf-8')
+        home_file = tmp / 'frontend/src/app/page.tsx'
+        home_content = home_file.read_text(encoding='utf-8')
+        home_content = ''.join(
+            line for line in home_content.splitlines(keepends=True)
+            if 'href="/scheduler-lab"' not in line
+        )
+        home_file.write_text(home_content, encoding='utf-8')
         for rel in ('frontend/src/app/scheduler-lab/page.tsx','frontend/src/app/scheduler-lab/scheduler-lab.css',
                     'frontend/src/app/api/scheduler-lab/route.ts','scripts/evaluate_queue_policies_v0_8.py',
                     'scripts/enable_scheduler_lab_v0_8.py'):
