@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Explicit opt-in backend restart exercise for CPU simulation ONLY.
+
+Requires local Docker Desktop and a completely idle SIMULATION-mode cluster.
+It restarts the backend container, never PostgreSQL or Redis, and never any GPU.
+"""
+from __future__ import annotations
+import argparse
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from uuid import uuid4
+
+
+def call(base, path, body=None, *, timeout=10):
+    request = urllib.request.Request(base.rstrip('/') + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={'Content-Type':'application/json'} if body is not None else {},
+        method='POST' if body is not None else 'GET')
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def poll(base, check, timeout_s=60, interval=.25):
+    end=time.monotonic()+timeout_s
+    while time.monotonic() < end:
+        try:
+            result=check()
+            if result: return result
+        except (urllib.error.URLError, TimeoutError, ValueError): pass
+        time.sleep(interval)
+    return None
+
+
+def save(folder, report):
+    folder.mkdir(parents=True,exist_ok=True)
+    (folder/'report.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
+
+
+def main():
+    parser=argparse.ArgumentParser(description='Exercise backend restart with synthetic jobs; requires explicit --run')
+    parser.add_argument('--run',action='store_true',help='Explicitly approve a restart of the LOCAL backend container')
+    parser.add_argument('--api-url',default='http://127.0.0.1:8000')
+    parser.add_argument('--timeout',type=int,default=180)
+    args=parser.parse_args()
+    if not args.run:
+        print('DRY RUN. Pass --run to submit simulated jobs and restart the LOCAL backend container.');return 0
+    base=args.api_url
+    if not (base.startswith('http://127.0.0.1:') or base.startswith('http://localhost:')):
+        raise RuntimeError('Refusing to restart a non-local controller URL')
+    cluster=call(base,'/api/cluster')
+    if cluster.get('mode')!='simulation':
+        raise RuntimeError('Simulation mode required. No remote GPU restart tests supported.')
+    if cluster['summary'].get('running_jobs',0) or cluster['summary'].get('queued_jobs',0):
+        raise RuntimeError('Controller not idle. Refusing to mix test jobs with existing jobs.')
+    models=call(base,'/api/models')['models']
+    if not models: raise RuntimeError('No simulated model profiles')
+    model=next((m['id'] for m in models if m['id']=='model-7b'),models[0]['id'])
+    # More jobs than total available node slots, with duration capped at 40s.
+    slots=sum(int(n.get('max_concurrent_jobs',2)) for n in cluster['nodes'] if not n.get('draining'))
+    if slots < 1 or slots > 32:
+        raise RuntimeError('Requires 1..32 eligible synthetic slots')
+    count=min(40, slots+2)
+    report={'status':'in_progress','source':'cpu_simulation','model':model,'jobs':count,
+            'events':[],'checks':{},'warning':'Simulation ONLY; not real MI300X restart recovery proof.'}
+    out=Path('results/hardening')/('restart_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid4().hex[:6])
+    try:
+        batch=call(base,'/api/jobs/batch',{'model':model,'count':count,'prompt':'Controller restart test',
+                    'prompt_tokens':3000,'output_tokens':1024,'priority':'normal'})
+        ids={j['id'] for j in batch['jobs']}
+        report['job_ids']=sorted(ids)
+        def has_running_and_queued():
+            c=call(base,'/api/cluster')['summary']
+            return c if c.get('queued_jobs',0)>0 and c.get('running_jobs',0)>0 else None
+        before=poll(base,has_running_and_queued,timeout_s=20)
+        if not before:
+            raise RuntimeError('Expected running+queued state not observed; refusing restart. Existing simulation jobs may continue.')
+        report['checks']['observed_queue_and_running']=True
+        report['before_restart']=before
+        report['events'].append({'event':'backend_restart_initiated','utc':datetime.now(timezone.utc).isoformat()})
+        cp=subprocess.run(['docker','compose','restart','backend'],capture_output=True,text=True,timeout=90)
+        if cp.returncode!=0:
+            raise RuntimeError('docker compose restart backend failed: '+cp.stderr[-300:])
+        ready=poll(base,lambda:call(base,'/health'),timeout_s=75,interval=.5)
+        if not ready: raise RuntimeError('Backend did not recover health within 75 seconds')
+        report['checks']['backend_healthy_after_restart']=True
+        status=call(base,'/api/hardening/status')
+        if not status.get('recovery',{}).get('available'):
+            raise RuntimeError('Missing startup reconciliation status')
+        report['checks']['recovery_record_created']=True
+        report['recovery']=status['recovery']
+        def finished():
+            records=call(base,'/api/jobs?limit=500')['jobs']
+            matched={j['id']:j for j in records if j['id'] in ids}
+            if len(matched)==len(ids) and all(j['status'] in ('completed','failed') for j in matched.values()):
+                return matched
+            return None
+        found=poll(base,finished,timeout_s=args.timeout,interval=1)
+        if not found: raise RuntimeError('Not all test jobs reached a terminal state within timeout')
+        report['checks']['all_jobs_terminal']=True
+        report['checks']['no_failed_simulation_jobs']=all(j['status']=='completed' for j in found.values())
+        report['checks']['all_ids_unique']=len(found)==count
+        report['status']='passed' if all(report['checks'].values()) else 'failed'
+        print(json.dumps({'status':report['status'],'checks':report['checks'],'output':str(out)},indent=2))
+    except Exception as e:
+        report['status']='failed'
+        report['error']=str(e)[:600]
+        print('Restart drill failed:',e,file=sys.stderr)
+    finally:
+        save(out,report)
+        print('Evidence:',out)
+    return 0 if report['status']=='passed' else 2
+
+if __name__=='__main__':
+    try: sys.exit(main())
+    except Exception as err:
+        print('STOPPED:',err,file=sys.stderr);sys.exit(2)

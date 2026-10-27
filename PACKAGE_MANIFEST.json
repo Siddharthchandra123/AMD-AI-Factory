@@ -1,0 +1,17 @@
+{
+  "name": "AMD AI Factory Phase 10 unified",
+  "version": "1.0",
+  "file_sha256": {
+    "README.md": "2698ab046f905495b4ba43eabe2c722933c5bffc5cff5c09eeba594d866381db",
+    "tests/test_phase10.py": "74e6c4b6bf33ff444cd2d4f025ec0e2d80c9d894904ea7e8be698fd3e72be65c",
+    "scripts/test_phase10_restart.py": "f6991a32b193ca93827ab04b18b9bb1c1384367a90dc42c7b7072bd3ee8d4260",
+    "scripts/monitor_phase10_workers.py": "b27a094780aefd6c4d17ca0689d78d5344af1d7f66fdf45fcf0b947cbc00be58",
+    "scripts/audit_phase10_security.py": "6ff83f598ff2dac2dc349390ae4cc4afa0fc4ec2df8f4ca85b25d897cefea43d",
+    "scripts/install_phase10.py": "b1f6af11fdcaf03559e359483232fa5687a9f3b08f44b4ebe6530c4becc4a18d",
+    "docs/PHASE_10_PROGRESS.md": "f803eee1c81d902dcba9d98cbe05887bd4064c7524e53a38df47951e65c4a356",
+    "backend/app/hardening.py": "7761c65bfd629efc1bf724d543fca25ae907bfbff7472475e5e23b03f666edf3",
+    "frontend/src/app/hardening/page.tsx": "ea77238d67baef37abaa7ed1e8b3805809d5765b137dcf0483f270fce5d64518",
+    "frontend/src/app/hardening/hardening.css": "d36876933ca5c2a169701e300e439e24e44e7d4095ad82f5f7118e67edbff907",
+    "frontend/src/app/api/hardening/route.ts": "251c4236dcf72dfc00a4fed4c4f3ccd45f9ba431589bef4f974e54725b3fdb1b"
+  }
+}

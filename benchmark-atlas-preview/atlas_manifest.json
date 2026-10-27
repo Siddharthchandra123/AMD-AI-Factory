@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-10-27T07:35:40.822496+00:00",
+  "project_root": "/mnt/data/amd_ai_benchmark_atlas_kit",
+  "sample_mode": true,
+  "real_runs": 4,
+  "sanitized_real_jobs": 0,
+  "telemetry_poll_rows": 0,
+  "profiler_trials": 0,
+  "policy_aggregate_rows": 0,
+  "policy_trial_rows": 0,
+  "synthetic_policy_job_rows": 0,
+  "worker_health_sample_rows": 0,
+  "operational_evidence_records": 0,
+  "graph_count": 12,
+  "index_csv_count": 13,
+  "warnings": [],
+  "security": "Read-only; does not copy prompt/output/auth fields; no network requests"
+}

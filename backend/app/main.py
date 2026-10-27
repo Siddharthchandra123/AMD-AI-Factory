@@ -28,6 +28,8 @@ from .scheduler import (MODEL_MEMORY_GB, VALID_POLICIES, VALID_QUEUE_POLICIES,
     PLACEMENT_POLICIES, QUEUE_POLICIES, QueueCandidate,
     estimated_simulation_seconds, rank_queue, select_node)
 from .simulator import RuntimeJob, VirtualCluster, VirtualGPU, now_utc
+from .hardening import (reconcile_pending_jobs, read_recovery_status,
+                        worker_health_summary, authorized_write_request)
 
 REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379/0')
 cache = redis.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -433,22 +435,9 @@ async def lifespan(app: FastAPI):
             connection.execute(text(sql))
     cache.ping()
     restore_simulator()
-    # Simulation can be retried, but an interrupted real vLLM request must NEVER
-    # be silently resubmitted (could generate duplicate processing/billing).
-    with SessionLocal.begin() as db:
-        records = db.scalars(select(InferenceJob).where(InferenceJob.status.in_(['queued', 'running']))).all()
-        for job in records:
-            if job.execution_mode == 'mi300x' and job.status == 'running':
-                job.status = 'failed'
-                job.error_message = 'Controller restarted while real inference was in flight; outcome unknown, not retried.'
-                job.completed_at = now_utc()
-                cache.lrem(queue_names[job.priority], 0, job.id)
-                continue
-            job.status = 'queued'
-            job.gpu_id = None
-            job.started_at = None
-            cache.lrem(queue_names[job.priority], 0, job.id)
-            cache.lpush(queue_names[job.priority], job.id)
+    # PHASE10: reconcile DB and Redis from durable jobs before dispatch begins.
+    summary = reconcile_pending_jobs(SessionLocal, InferenceJob, cache, queue_names, now_utc)
+    print('Phase 10 recovery:', json.dumps(summary), flush=True)
     await live.refresh()
     task = asyncio.create_task(worker_loop())
     telemetry_task = asyncio.create_task(discovery_loop())
@@ -739,3 +728,33 @@ async def loadtest_stop():
 @app.get('/api/loadtest')
 def loadtest_status():
     return {'active': bool(loadtest_task and not loadtest_task.done()), 'simulation_only': True}
+
+
+# PHASE10: optional local-only write protection and defense-in-depth headers.
+# This does NOT protect read APIs or the SSE feed; keep controller on loopback.
+@app.middleware('http')
+async def phase10_write_guard(request, call_next):
+    from fastapi.responses import JSONResponse
+    configured = os.getenv('MISSION_CONTROL_WRITE_TOKEN', '')
+    supplied = request.headers.get('X-Mission-Api-Key', '')
+    if not authorized_write_request(request.method, request.url.path, supplied, configured):
+        return JSONResponse({'detail': 'Missing or invalid Mission Control write token'}, status_code=401)
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    if request.url.path.startswith('/api/jobs') or request.url.path.startswith('/api/hardening'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.get('/api/hardening/status')
+def phase10_hardening_status():
+    return {
+        'phase': '10.1-10.4',
+        'recovery': read_recovery_status(cache),
+        'workers': worker_health_summary(get_mode(), get_snapshots()),
+        'security': {
+            'write_token_enabled': bool(os.getenv('MISSION_CONTROL_WRITE_TOKEN', '')),
+            'note': 'Optional token protects mutations only, not read APIs. Bind locally or use an authenticated reverse proxy.',
+        },
+    }

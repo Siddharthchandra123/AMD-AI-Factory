@@ -103,6 +103,9 @@ export default function Home(){
         <a href="#gpu-nodes"><Server size={18}/> Live GPU fleet</a>
         <a href="#job-queue"><Layers size={18}/> Workload queue</a>
         <a href="#runtime"><Settings2 size={18}/> Runtime & topology</a>
+        <a href="/benchmarks"><BarChart3 size={18}/> Benchmark Analytics <ArrowRight size={13}/></a>
+        <a href="/scheduler-lab"><Layers size={18}/> Scheduler Lab <ArrowRight size={13}/></a>
+        <a href="/hardening"><ShieldAlert size={18}/> Reliability &amp; Hardening <ArrowRight size={13}/></a>
         <a href="http://localhost:3001" target="_blank" rel="noreferrer"><BarChart3 size={18}/> Grafana <ArrowRight size={13}/></a>
         <a href="http://localhost:9090" target="_blank" rel="noreferrer"><Activity size={18}/> Prometheus <ArrowRight size={13}/></a>
       </nav>

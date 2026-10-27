@@ -1,0 +1,13 @@
+{
+  "files": [
+    {
+      "path": "backend/app/main.py"
+    },
+    {
+      "path": "docker-compose.yml"
+    },
+    {
+      "path": "frontend/src/app/page.tsx"
+    }
+  ]
+}

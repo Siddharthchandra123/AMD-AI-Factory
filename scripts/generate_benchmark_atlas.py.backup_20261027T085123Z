@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""AMD AI Factory: read-only archive-wide benchmark index, charts, and HTML report.
+Python 3.10+ standard library only. No network, Docker, GPU or secrets required.
+Never copies prompt text, model output, auth tokens, raw error messages, or .env files.
+"""
+from __future__ import annotations
+import argparse, csv, json, math, re, statistics, sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from html import escape
+from xml.sax.saxutils import escape as xescape
+
+FIELDS = [
+ ('requested_jobs','Requests submitted','count'),('completed','Completed jobs','count'),('failed','Failed jobs','count'),
+ ('p50_queue_wait_seconds','Queue wait p50','s'),('p95_queue_wait_seconds','Queue wait p95','s'),
+ ('p50_inference_seconds','Inference p50','s'),('p95_inference_seconds','Inference p95','s'),
+ ('p50_end_to_end_seconds','End-to-end p50','s'),('p95_end_to_end_seconds','End-to-end p95','s'),
+ ('client_observed_wall_seconds','Client wall clock','s'),('controller_lifecycle_span_seconds','Controller lifecycle span','s'),
+ ('observed_client_tokens_per_second','Client-observed output throughput','output tok/s'),
+ ('controller_lifecycle_tokens_per_second','Controller span throughput','output tok/s'),
+ ('peak_polled_hbm_gib','Largest sampled HBM usage','GiB'),('gpu_poll_rows','GPU poll rows','count'),
+ ('completion_tokens','Completion tokens','count'),('p99_queue_wait_derived','Derived queue p99','s'),
+ ('mean_queue_wait_derived','Derived mean queue wait','s'),('sd_queue_wait_derived','Derived queue wait stdev','s'),
+ ('p99_end_to_end_derived','Derived E2E p99','s'),('mean_end_to_end_derived','Derived mean E2E','s'),
+ ('jobs_per_client_second_derived','Completed jobs / client wall','jobs/s'),
+ ('completion_rate_pct_derived','Completion rate','%'),('poststart_extra_mean_derived','Poststart overhead mean','s'),
+]
+NUM_KEYS = {x[0] for x in FIELDS}
+COLUMNS_RUN = ['run_id','evidence_type','source','model','timestamp_utc','requested_jobs','completed','failed','completion_rate_pct_derived',
+ 'p50_queue_wait_seconds','p95_queue_wait_seconds','p99_queue_wait_derived','mean_queue_wait_derived','sd_queue_wait_derived',
+ 'p50_inference_seconds','p95_inference_seconds','p50_end_to_end_seconds','p95_end_to_end_seconds','p99_end_to_end_derived',
+ 'client_observed_wall_seconds','controller_lifecycle_span_seconds','observed_client_tokens_per_second',
+ 'controller_lifecycle_tokens_per_second','jobs_per_client_second_derived','peak_polled_hbm_gib','gpu_poll_rows',
+ 'completion_tokens','endpoint_count','poststart_extra_mean_derived','raw_job_rows','data_completeness','relative_source']
+COLUMNS_JOB=['run_id','job_id_redacted','status','model','gpu_id','created_at','started_at','completed_at',
+ 'queue_wait_seconds','execution_seconds','end_to_end_seconds','completion_tokens','poststart_extra_derived']
+COLUMNS_TEL=['run_id','polled_utc','endpoint','health','gpu_util_percent','hbm_total_gib','hbm_used_gib','temperature_c','power_w','cluster_running_jobs','cluster_queued_jobs']
+COLUMNS_PROF=['run_id','trial','path','client_seconds','vllm_reported_seconds','agent_overhead_seconds','controller_queue_seconds','controller_poststart_extra_seconds','completion_tokens']
+COLUMNS_POLICY=['run_id','scenario','policy','trials','completed','mean_wait_s','p50_wait_s','p95_wait_s','p95_turnaround_s','high_priority_p95_wait_s','deadline_met_pct','tenant_mean_wait_gap_s','starvation_proxy_count','throughput_jobs_per_s']
+COLUMNS_EVENTS=['run_id','evidence_type','timestamp','status','checks_passed','checks_total','note','relative_source']
+COLUMNS_POLICY_TRIAL=['run_id','scenario','trial','policy','completed','mean_wait_s','p50_wait_s','p95_wait_s','p95_turnaround_s','deadline_met_pct','tenant_mean_wait_gap_s','throughput_jobs_per_s']
+COLUMNS_POLICY_JOB=['run_id','scenario','trial','policy','job_id','priority','tenant','arrival_s','started_s','completed_s','service_s','estimate_s','deadline_s','queue_wait_s','turnaround_s','deadline_met']
+COLUMNS_WORKER=['run_id','at','mode','worker_id','health','ready','draining','active_jobs']
+REQUIRED={'requested_jobs','completed','failed','p95_inference_seconds'}
+
+
+def jread(path):
+    try:
+        return json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError,ValueError,UnicodeError) as exc:
+        return {'__parse_error__': str(type(exc).__name__)}
+
+def cread(path, max_rows=300000):
+    if not path.is_file(): return []
+    try:
+        with path.open(encoding='utf-8-sig', newline='') as f:
+            return [row for _,row in zip(range(max_rows), csv.DictReader(f))]
+    except (OSError,UnicodeError,csv.Error): return []
+
+def val(v):
+    if isinstance(v,bool) or v in (None,'','null','None'):return None
+    try:
+        n=float(v)
+        return n if math.isfinite(n) else None
+    except (TypeError,ValueError,OverflowError):return None
+
+def quantile(xs,p):
+    xs=sorted(x for x in xs if x is not None)
+    if not xs:return None
+    i=(len(xs)-1)*p; a=int(math.floor(i)); b=int(math.ceil(i))
+    return round(xs[a]*(b-i)+xs[b]*(i-a),5) if a!=b else round(xs[a],5)
+
+def avg(xs):
+    x=[v for v in xs if v is not None];return round(statistics.mean(x),5) if x else None
+
+def iso(t):
+    if not t:return None
+    try:return datetime.fromisoformat(str(t).replace('Z','+00:00'))
+    except ValueError:return None
+
+def duration(a,b):
+    a,b=iso(a),iso(b)
+    return round((b-a).total_seconds(),5) if a and b else None
+
+def safe_id(s):
+    return re.sub(r'[^A-Za-z0-9_.-]+','_',str(s))[:85]
+
+def write_csv(p, cols, rows):
+    p.parent.mkdir(parents=True,exist_ok=True)
+    with p.open('w',newline='',encoding='utf-8') as f:
+        w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore');w.writeheader();w.writerows(rows)
+
+def write_svg(path, txt):path.parent.mkdir(parents=True,exist_ok=True);path.write_text(txt,encoding='utf-8')
+
+def num(n,digits=2):return '—' if n is None else f'{n:,.{digits}f}'
+
+def svg_start(w=1080,h=460,title=''):
+    s=f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}" role="img" aria-label="{xescape(title)}">'
+    s+=f'<rect width="{w}" height="{h}" rx="15" fill="#111927"/>'
+    s+=f'<text x="28" y="38" font-size="22" font-family="Segoe UI,Arial" font-weight="700" fill="#f8fafc">{xescape(title)}</text>'
+    return s
+
+def svg_text(x,y,t,size=13,fill='#cbd5e1',anchor='start'):
+    return f'<text x="{x}" y="{y}" text-anchor="{anchor}" font-size="{size}" fill="{fill}" font-family="Segoe UI,Arial">{xescape(str(t))}</text>'
+
+PALETTE=['#5bc0eb','#e29f5e','#68d391','#a78bfa','#fc8181','#ffd166','#56c4b7']
+
+def grouped_bar(path,title,labels,series,unit='',subtitle='', ymax=None):
+    n=len(labels)
+    if not n:return False
+    w=1100;h=480;L=92;R=35;T=88;B=112;wid=w-L-R;ht=h-T-B
+    maxv=max((v for _,arr in series for v in arr if v is not None),default=1)
+    high=ymax or max(1,maxv*1.15)
+    s=svg_start(w,h,title)
+    if subtitle:s+=svg_text(30,62,subtitle,12,'#94a3b8')
+    for j in range(5):
+        yy=T+ht-j*ht/4; vv=high*j/4
+        s+=f'<line x1="{L}" y1="{yy}" x2="{w-R}" y2="{yy}" stroke="#334155" stroke-width="1"/>'
+        s+=svg_text(L-9,yy+5,f'{vv:.1f}',12,'#94a3b8','end')
+    slot=wid/n;g=min(22,slot/(len(series)+1));barw=min(55,(slot-16)/max(1,len(series)))
+    for i,name in enumerate(labels):
+        cx=L+(i+.5)*slot
+        for k,(sr,vs) in enumerate(series):
+            v=vs[i]
+            if v is None:continue
+            bh=max(1,ht*v/high);xx=cx-len(series)*barw/2+k*barw
+            s+=f'<rect x="{xx:.2f}" y="{T+ht-bh:.2f}" width="{barw-3:.2f}" height="{bh:.2f}" rx="3" fill="{PALETTE[k%len(PALETTE)]}"/>'
+            if n<=8:s+=svg_text(xx+barw/2,T+ht-bh-7,f'{v:.2f}',11,'#e2e8f0','middle')
+        label=name if len(name)<=27 else name[:25]+'…'
+        s+=svg_text(cx,T+ht+23,label,12,'#cbd5e1','middle')
+    for k,(sr,_) in enumerate(series):
+        x=42+k*max(180,int(w/max(1,len(series))))
+        s+=f'<rect x="{x}" y="{h-41}" width="12" height="12" fill="{PALETTE[k%len(PALETTE)]}" rx="2"/>'
+        s+=svg_text(x+19,h-30,sr,13)
+    if unit:s+=svg_text(w-30,h-30,unit,12,'#94a3b8','end')
+    write_svg(path,s+'</svg>');return True
+
+def linechart(path,title,labels,series,unit='',subtitle=''):
+    n=len(labels)
+    if n==0:return False
+    w=1100;h=460;L=94;R=42;T=85;B=116;wd=w-L-R;ht=h-T-B
+    high=max((v for _,arr in series for v in arr if v is not None),default=1)*1.14 or 1
+    s=svg_start(w,h,title)
+    if subtitle:s+=svg_text(30,62,subtitle,12,'#94a3b8')
+    for j in range(5):
+        yy=T+ht-j*ht/4
+        s+=f'<line x1="{L}" y1="{yy}" x2="{w-R}" y2="{yy}" stroke="#334155"/>'
+        s+=svg_text(L-8,yy+4,num(high*j/4,1),12,'#94a3b8','end')
+    for k,(label,arr) in enumerate(series):
+        pts=[]
+        for i,v in enumerate(arr):
+            if v is None:continue
+            xx=L+((i+.5)/n)*wd;yy=T+ht-v/high*ht
+            pts.append((xx,yy))
+        if pts:
+            s+=f'<polyline fill="none" stroke="{PALETTE[k%len(PALETTE)]}" stroke-width="3" points="'+ ' '.join(f'{a:.2f},{b:.2f}' for a,b in pts)+'"/>'
+            for xx,yy in pts:s+=f'<circle cx="{xx:.2f}" cy="{yy:.2f}" r="4.5" fill="{PALETTE[k%len(PALETTE)]}"/>'
+    skip=max(1,math.ceil(n/11))
+    for i,label in enumerate(labels):
+        if i%skip==0 or i==n-1:s+=svg_text(L+((i+.5)/n)*wd,T+ht+25,str(label)[:23],11,'#cbd5e1','middle')
+    for k,(name,_) in enumerate(series):
+        xx=34+k*min(260,w/max(1,len(series)))
+        s+=f'<rect x="{xx}" y="{h-43}" width="15" height="4" fill="{PALETTE[k%len(PALETTE)]}"/>'
+        s+=svg_text(xx+22,h-33,name,13)
+    if unit:s+=svg_text(w-30,h-32,unit,11,'#94a3b8','end')
+    write_svg(path,s+'</svg>');return True
+
+def timeline(path,rows,title):
+    if not rows:return False
+    n=min(80,len(rows));rows=sorted(rows,key=lambda r:(val(r.get('elapsed_start_s')) or 0))[:n]
+    w=1100;h=130+max(n*31,250);L=145;R=48;T=79;B=55;wd=w-L-R;ht=h-T-B
+    maxx=max((val(r.get('elapsed_start_s')) or 0)+(val(r.get('poststart_lifecycle_s')) or 0) for r in rows)*1.08 or 1
+    s=svg_start(w,h,title)
+    for t in range(math.ceil(maxx)+1):
+        if t % max(1,math.ceil(maxx/10)):continue
+        x=L+wd*t/maxx;s+=f'<line x1="{x:.2f}" y1="{T}" x2="{x:.2f}" y2="{h-B}" stroke="#29384d"/>'
+        s+=svg_text(x,T-9,str(t)+'s',11,'#94a3b8','middle')
+    for i,r in enumerate(rows):
+        y=T+i*31;start=val(r.get('elapsed_start_s')) or 0
+        infer=val(r.get('inference_s')) or 0;post=val(r.get('poststart_lifecycle_s')) or 0
+        barw=wd*max(0,post)/maxx;xx=L+wd*start/maxx
+        s+=f'<rect x="{xx:.2f}" y="{y}" width="{max(2,barw):.2f}" height="19" rx="3" fill="#c48e54"/>'
+        s+=f'<rect x="{xx:.2f}" y="{y}" width="{max(2,wd*min(infer,post)/maxx):.2f}" height="19" rx="3" fill="#5bc0eb"/>'
+        s+=svg_text(L-12,y+15,f'Wave {r.get("wave","")}: {r.get("id_prefix",i)}',11,'#cbd5e1','end')
+    s+=svg_text(L,h-20,'Blue = measured inference HTTP call | Amber = remaining post-start lifecycle | X = seconds since first job started',12,'#cbd5e1')
+    write_svg(path,s+'</svg>');return True
+
+def html_table(rows,fields,display_count=1500):
+    s='<div class="table-wrap"><table><thead><tr>'+''.join(f'<th>{escape(k.replace("_"," ").title())}</th>' for k in fields)+'</tr></thead><tbody>'
+    for r in rows[:display_count]:
+        s+='<tr>'+''.join('<td>'+escape('' if r.get(k) is None else str(r.get(k)))+'</td>' for k in fields)+'</tr>'
+    return s+'</tbody></table></div>'
+
+def source_iter(project,examples):
+    real=project/'results'/'mi300x'
+    if real.exists():
+        for p in sorted(real.glob('v2_*/summary.json')):yield ('v2',p)
+        for p in sorted(real.glob('latency_diag_v06_*/summary.json')):yield ('profiler',p)
+        p=real/'real-summary.json'
+        if p.exists():yield ('legacy',p)
+    labs=project/'results'/'scheduler-lab'
+    if labs.exists():
+        for p in sorted(labs.glob('lab_*/summary.json')):yield ('policy',p)
+    reli=project/'results'/'reliability'
+    if reli.exists():
+        for p in sorted(reli.glob('reliability_*/report.json')):yield ('reliability',p)
+    hard=project/'results'/'hardening'
+    if hard.exists():
+        for p in sorted(hard.glob('restart_*/report.json')):yield ('restart',p)
+        for p in sorted(hard.glob('worker_watch_*.json')):yield ('monitor',p)
+        if (hard/'security_audit.json').exists():yield ('security',hard/'security_audit.json')
+    moni=project/'results'/'monitoring'
+    if moni.exists():
+        for p in sorted(moni.glob('*.json')):yield ('prometheus',p)
+    if examples:
+        sample=Path(__file__).resolve().parents[1]/'sample_evidence'/'documented_benchmarks.csv'
+        if sample.exists():yield ('documented',sample)
+
+def collect(project,examples=False):
+    runs=[];jobs=[];telemetry=[];profiles=[];policy=[];policy_trials=[];policy_jobs=[];workers=[];events=[];quality=[];files=[];traces=[];unseen=[]
+    paths=list(source_iter(project,examples))
+    for kind,p in paths:
+        rel=str(p.relative_to(project)) if p.is_relative_to(project) else 'sample_evidence/'+p.name
+        folder=p.parent.name;run_id=folder if kind not in ('legacy','documented','security') else ('legacy_real_v03' if kind=='legacy' else kind)
+        files.append({'kind':kind,'run_id':run_id,'relative_source':rel,'size_bytes':p.stat().st_size})
+        if kind=='documented':
+            for ix,r in enumerate(cread(p),1):
+                rr={'run_id':f'documented_{ix:02d}_{safe_id(r.get("name",""))}','evidence_type':'documented_real_summary',
+                    'source':'reconstructed_user_report','model':'Qwen/Qwen3-0.6B','timestamp_utc':'2026-10-26',
+                    'requested_jobs':val(r.get('jobs')),'completed':val(r.get('completed')),'failed':val(r.get('failed')),
+                    'p50_queue_wait_seconds':val(r.get('queue_p50')),'p95_queue_wait_seconds':val(r.get('queue_p95')),
+                    'p50_inference_seconds':val(r.get('infer_p50')),'p95_inference_seconds':val(r.get('infer_p95')),
+                    'p50_end_to_end_seconds':val(r.get('e2e_p50')),'p95_end_to_end_seconds':val(r.get('e2e_p95')),
+                    'client_observed_wall_seconds':val(r.get('client_wall')),'controller_lifecycle_span_seconds':val(r.get('controller_span')),
+                    'observed_client_tokens_per_second':val(r.get('throughput')) if r.get('phase')!='Original' else None,'controller_lifecycle_tokens_per_second':val(r.get('controller_tps')),
+                    'peak_polled_hbm_gib':val(r.get('hbm')),'data_completeness':'reconstructed summary; original per-run CSV unavailable',
+                    'relative_source':rel,'raw_job_rows':0,'endpoint_count':1}
+                c=rr['completed'];q=rr['requested_jobs'];rr['completion_rate_pct_derived']=100*c/q if c is not None and q else None
+                runs.append(rr)
+            trace=Path(__file__).resolve().parents[1]/'sample_evidence'/'documented_16job_trace.csv'
+            traces=cread(trace)
+            continue
+        obj=jread(p)
+        if '__parse_error__' in obj:
+            quality.append({'source':rel,'level':'error','issue':'JSON parse failed'});continue
+        if kind in ('v2','legacy'):
+            realkind=(kind=='v2')
+            smap= obj if realkind else {
+                'source':obj.get('source'),'mode':obj.get('mode'),'model':obj.get('model'),
+                'requested_jobs':obj.get('submitted'),'completed':obj.get('completed'),'failed':obj.get('failed'),
+                'p50_inference_seconds':obj.get('p50_job_seconds'),'p95_inference_seconds':obj.get('p95_job_seconds'),
+                'controller_lifecycle_span_seconds':obj.get('makespan_seconds'),
+                'observed_client_tokens_per_second':None,'controller_lifecycle_tokens_per_second':obj.get('completion_tokens_per_second'),
+                'gpu_poll_rows':obj.get('gpu_samples'),
+            }
+            record={k:val(smap.get(k)) for k in NUM_KEYS}
+            record.update({'run_id':run_id,'evidence_type':'real_v2' if realkind else 'real_legacy',
+               'source':str(smap.get('source') or ''),'model':str(smap.get('model') or ''),'timestamp_utc':p.parent.name,
+               'endpoint_count':len(smap.get('unique_serving_endpoints',[]) or smap.get('observed_serving_endpoints',[]) or []),
+               'relative_source':rel,'data_completeness':'raw summary + job/telemetry available' if realkind else 'legacy summary',
+               'raw_job_rows':0})
+            record['completion_rate_pct_derived']=round(100*record['completed']/record['requested_jobs'],3) if record.get('requested_jobs') and record.get('completed') is not None else None
+            record['jobs_per_client_second_derived']=round(record['completed']/record['client_observed_wall_seconds'],5) if record.get('client_observed_wall_seconds') and record.get('completed') is not None else None
+            raw=cread(p.parent/'jobs.csv') if realkind else cread(p.parent/'real-jobs.csv')
+            extracted=[]
+            for jr in raw:
+                jd={k:jr.get(k,'') for k in COLUMNS_JOB}
+                rawid=str(jr.get('id') or '')
+                jd['run_id']=run_id;jd['job_id_redacted']=rawid[:8] if rawid else ''
+                # drop raw free-text fields, errors, prompts, results, etc
+                for k in ('queue_wait_seconds','execution_seconds','end_to_end_seconds','completion_tokens'):jd[k]=val(jr.get(k))
+                jd['poststart_extra_derived']=None
+                lc=duration(jr.get('started_at'),jr.get('completed_at'))
+                if lc is not None and jd['execution_seconds'] is not None:jd['poststart_extra_derived']=round(lc-jd['execution_seconds'],5)
+                if jd['end_to_end_seconds'] is None:jd['end_to_end_seconds']=duration(jr.get('created_at'),jr.get('completed_at'))
+                extracted.append(jd)
+            jobs.extend(extracted)
+            record['raw_job_rows']=len(extracted)
+            if extracted:
+                waits=[r['queue_wait_seconds'] for r in extracted];e2es=[r['end_to_end_seconds'] for r in extracted]
+                record.update({'p99_queue_wait_derived':quantile(waits,.99),'mean_queue_wait_derived':avg(waits),
+                 'sd_queue_wait_derived':round(statistics.stdev([x for x in waits if x is not None]),5) if len([x for x in waits if x is not None])>=2 else None,
+                 'p99_end_to_end_derived':quantile(e2es,.99),'mean_end_to_end_derived':avg(e2es),
+                 'poststart_extra_mean_derived':avg([r['poststart_extra_derived'] for r in extracted])})
+            tele=cread(p.parent/'telemetry_polls.csv') if realkind else cread(p.parent/'real-telemetry.csv')
+            for x in tele:
+                td={'run_id':run_id}
+                for k in COLUMNS_TEL:
+                    if k in ('run_id','polled_utc','endpoint','health'):td[k]=x.get(k)
+                    else:td[k]=val(x.get(k))
+                telemetry.append(td)
+            if kind=='v2':
+                missing=[k for k in REQUIRED if smap.get(k) is None]
+                if missing:quality.append({'source':rel,'level':'warning','issue':'Missing expected: '+', '.join(sorted(missing))})
+                if val(smap.get('gpu_poll_rows')) is not None and val(smap.get('gpu_poll_rows')) < 5:
+                    quality.append({'source':rel,'level':'caution','issue':'Fewer than five polling rows; GPU time-series too sparse for peak characterization'})
+            runs.append(record)
+        elif kind=='profiler':
+            by_path=obj.get('results') or {}
+            for lab,meta in by_path.items():
+                runs.append({'run_id':run_id+'_'+lab,'evidence_type':'real_latency_profiler','source':'amd_smi',
+                 'model':obj.get('model',''),'timestamp_utc':obj.get('timestamp_utc',''),
+                 'p50_end_to_end_seconds':val(meta.get('median_client_seconds')),
+                 'p95_end_to_end_seconds':val(meta.get('p95_client_seconds')),
+                 'relative_source':rel,'data_completeness':'3-path small-sample profiler','raw_job_rows':0})
+            for rr in cread(p.parent/'requests.csv'):
+                profiles.append({'run_id':run_id,'trial':val(rr.get('trial')),'path':rr.get('path'),
+                 **{k:val(rr.get(k)) for k in COLUMNS_PROF if k not in ('run_id','trial','path')}})
+        elif kind=='policy':
+            for rr in obj.get('aggregates',[]):
+                pol={'run_id':run_id,'scenario':rr.get('scenario'),'policy':rr.get('policy')}
+                pol.update({k:val(rr.get(k)) for k in COLUMNS_POLICY if k not in pol})
+                policy.append(pol)
+            for rr in cread(p.parent/'runs.csv'):
+                tr={'run_id':run_id,'scenario':rr.get('scenario'),'policy':rr.get('policy')}
+                tr.update({k:val(rr.get(k)) for k in COLUMNS_POLICY_TRIAL if k not in tr})
+                policy_trials.append(tr)
+            for rr in cread(p.parent/'jobs.csv'):
+                jj={'run_id':run_id}
+                for k in COLUMNS_POLICY_JOB:
+                    if k=='run_id':continue
+                    if k in ('scenario','policy','job_id','priority','tenant'):
+                        jj[k]=str(rr.get(k,'') or '')[:64]
+                    else:jj[k]=val(rr.get(k))
+                policy_jobs.append(jj)
+        else:
+            if kind=='monitor':
+                for entry in obj.get('samples',[]):
+                    if not isinstance(entry,dict):continue
+                    for node in entry.get('nodes',[]) or []:
+                        workers.append({'run_id':run_id,'at':entry.get('at'),'mode':entry.get('mode'),
+                            'worker_id':node.get('id'),'health':node.get('health'),
+                            'ready':node.get('ready'),'draining':node.get('draining'),
+                            'active_jobs':val(node.get('active_jobs'))})
+            checks=obj.get('checks');check_total=check_passed=None
+            if isinstance(checks,dict):
+                check_total=len(checks);check_passed=sum(v is True for v in checks.values())
+            if isinstance(checks,list):
+                check_total=len(checks);check_passed=sum(bool(x.get('passed')) for x in checks)
+            if kind=='security' and check_total is None:pass
+            events.append({'run_id':run_id,'evidence_type':kind,'timestamp':obj.get('at_utc',obj.get('timestamp_utc','')),
+                'status':obj.get('status','recorded'),'checks_passed':check_passed,'checks_total':check_total,
+                'note':'A status record; does not prove all end-to-end behaviors','relative_source':rel})
+    if not paths:quality.append({'source':'results','level':'warning','issue':'No evidence found. Use --sample to create preview from documented values.'})
+    return {'runs':runs,'jobs':jobs,'telemetry':telemetry,'profiles':profiles,'policy':policy,'policy_trials':policy_trials,'policy_jobs':policy_jobs,'workers':workers,'events':events,'quality':quality,'files':files,'traces':traces}
+
+def compare_runs(runs):
+    groups=defaultdict(list)
+    for r in runs:
+        if r.get('evidence_type') not in ('real_v2','documented_real_summary'):continue
+        key=(r.get('requested_jobs'),r.get('model'))
+        if key[0]:groups[key].append(r)
+    rows=[]
+    for (job_count,model),items in sorted(groups.items(),key=lambda t:((t[0][0] or 0),t[0][1] or '')):
+        items=sorted(items,key=lambda x:x.get('timestamp_utc',''))
+        for i in range(1,len(items)):
+            a,b=items[i-1],items[i]
+            p0,p1=a.get('p95_end_to_end_seconds'),b.get('p95_end_to_end_seconds')
+            q0,q1=a.get('p95_queue_wait_seconds'),b.get('p95_queue_wait_seconds')
+            t0,t1=a.get('observed_client_tokens_per_second'),b.get('observed_client_tokens_per_second')
+            rows.append({'jobs':job_count,'model':model,'run_before':a['run_id'],'run_after':b['run_id'],
+                'p95_e2e_before_s':p0,'p95_e2e_after_s':p1,
+                'p95_e2e_reduction_pct':round((p0-p1)/p0*100,3) if p0 and p1 is not None else None,
+                'p95_queue_reduction_pct':round((q0-q1)/q0*100,3) if q0 and q1 is not None else None,
+                'client_throughput_change_pct':round((t1-t0)/t0*100,3) if t0 and t1 is not None else None,
+                'comparison_validity':'descriptive only; same jobs/model, other settings may differ'})
+    return rows
+
+def render_graphs(output,d):
+    fig=output/'figures';fig.mkdir(parents=True,exist_ok=True)
+    catalog=[]
+    def bar(filename,title,items,series,unit='',note=''):
+        if items and grouped_bar(fig/filename,title,items,series,unit,note):catalog.append((filename,title))
+    def line(filename,title,labels,series,unit='',note=''):
+        if labels and linechart(fig/filename,title,labels,series,unit,note):catalog.append((filename,title))
+    r=[x for x in d['runs'] if x.get('evidence_type') in ('real_v2','real_legacy','documented_real_summary')]
+    r=sorted(r,key=lambda a:a.get('timestamp_utc',''))
+    rr=r[:32]; labels=[x['run_id'].replace('documented_','D').replace('v2_20261026_','v2_')[:24] for x in rr]
+    if rr:
+        bar('01_queue_latency.svg','Queue wait latency: p50 vs p95',labels,[('p50',[x.get('p50_queue_wait_seconds') for x in rr]),('p95',[x.get('p95_queue_wait_seconds') for x in rr])],'seconds','Real MI300X; legacy run may not include queue percentiles')
+        bar('02_e2e_latency.svg','End-to-end latency: p50 vs p95',labels,[('p50',[x.get('p50_end_to_end_seconds') for x in rr]),('p95',[x.get('p95_end_to_end_seconds') for x in rr])],'seconds')
+        bar('03_inference_latency.svg','Agent-reported inference HTTP duration',labels,[('p50',[x.get('p50_inference_seconds') for x in rr]),('p95',[x.get('p95_inference_seconds') for x in rr])],'seconds')
+        bar('04_client_throughput.svg','Client-observed completion throughput',labels,[('output tok/s',[x.get('observed_client_tokens_per_second') for x in rr])],'tok/s','Legacy v0.3 throughput metric intentionally omitted')
+        bar('05_controller_span.svg','Controller lifecycle span',labels,[('span',[x.get('controller_lifecycle_span_seconds') for x in rr])],'seconds')
+        bar('06_success_count.svg','Successful and failed jobs by run',labels,[('complete',[x.get('completed') for x in rr]),('failed',[x.get('failed') for x in rr])],'jobs')
+        eligible=[x for x in rr if x.get('evidence_type') in ('real_v2','documented_real_summary') and x.get('requested_jobs') and x.get('observed_client_tokens_per_second')]
+        line('07_throughput_vs_load.svg','Throughput by increasing workload',[str(int(x['requested_jobs']))+' jobs' for x in eligible],[('client tok/s',[x['observed_client_tokens_per_second'] for x in eligible])],'tok/s','Points show experiments; repeated job counts may reflect different controller builds')
+        line('08_queue_vs_load.svg','p95 queue waiting by workload',[str(int(x['requested_jobs']))+' jobs' for x in eligible],[('p95 queue s',[x.get('p95_queue_wait_seconds') for x in eligible])],'seconds')
+        bar('09_memory_snapshots.svg','Highest sampled HBM across benchmark runs',labels,[('sampled HBM GiB',[x.get('peak_polled_hbm_gib') for x in rr])],'GiB','Sparse telemetry snapshots; NOT peak physical HBM over full run')
+    if d['jobs']:
+        j=d['jobs'];from_run=defaultdict(list)
+        for row in j:from_run[row['run_id']].append(row)
+        # Choose longest real run with per-job records, show queue and end-to-end by ordered job start.
+        name,rows=max(from_run.items(),key=lambda t:len(t[1]));rows=sorted(rows,key=lambda a:a.get('started_at') or '')[:100]
+        xs=[str(i+1) for i in range(len(rows))]
+        line('10_per_job_queue.svg',f'Individual job queue waits: {name}',xs,[('queue wait s',[x.get('queue_wait_seconds') for x in rows])],'seconds')
+        line('11_per_job_e2e.svg',f'Individual job end-to-end: {name}',xs,[('E2E s',[x.get('end_to_end_seconds') for x in rows])],'seconds')
+        bar('12_poststart_breakdown.svg',f'Post-start overhead: {name}',xs,[('Inference',[x.get('execution_seconds') for x in rows]),('Other poststart',[x.get('poststart_extra_derived') for x in rows])],'seconds','Bars compare components; poststart is not entire end-to-end lifecycle')
+    if d['traces']:
+        if timeline(fig/'13_16_job_gantt.svg',d['traces'],'16-job trace: real MI300X dispatch timeline'):
+            catalog.append(('13_16_job_gantt.svg','16-job dispatch timeline'))
+        tr=d['traces'];w=defaultdict(list)
+        for x in tr:w[str(x.get('wave',''))].append(val(x.get('elapsed_start_s')))
+        waves=sorted(w,key=lambda x:int(x) if x.isdigit() else x)
+        line('14_job_wave_intervals.svg','First job start time by worker wave',waves,[('Start offset s',[min(y for y in w[x] if y is not None) for x in waves])],'seconds')
+    prof=d['profiles']
+    if prof:
+        group=defaultdict(list)
+        for row in prof:group[row['path']].append(row['client_seconds'])
+        keys=['direct_vllm','agent_vllm','mission_control']
+        bar('15_profiler_paths.svg','Profiler median / p95 client latency',keys,[('median s',[quantile(group[k],.5) for k in keys]),('p95 s',[quantile(group[k],.95) for k in keys])],'seconds','Sequential trials over Windows SSH forwarding; small sample')
+    else:
+        # Historical profiler medians given directly by user, but only in sample mode.
+        if any(x.get('evidence_type')=='documented_real_summary' for x in r):
+            keys=['Direct vLLM','Via agent','Mission Control']
+            bar('15_profiler_paths.svg','Profiler median / p95 client latency',keys,[('median s',[1.5487,1.1988,1.845]),('p95 s',[1.5703,1.6402,1.9246])],'seconds','Documented 3-trial profiler summary from conversation; no raw profiler file')
+    pol=d['policy']
+    if pol:
+        for scenario in sorted({x['scenario'] for x in pol if x.get('scenario')}):
+            rows=sorted((x for x in pol if x['scenario']==scenario),key=lambda a:a.get('policy',''))
+            lab=[x['policy'] for x in rows]; slug=safe_id(scenario)
+            bar(f'16_{slug}_policy_p95_wait.svg','Synthetic policy p95 wait - '+scenario,lab,[('p95 wait s',[x.get('p95_wait_s') for x in rows])],'seconds','CPU simulation; not a physical MI300X comparison')
+            bar(f'17_{slug}_policy_deadlines.svg','Synthetic deadline completion - '+scenario,lab,[('Deadline met %',[x.get('deadline_met_pct') for x in rows])],'%')
+            bar(f'18_{slug}_policy_fairness.svg','Synthetic tenant waiting gap - '+scenario,lab,[('Tenant gap s',[x.get('tenant_mean_wait_gap_s') for x in rows])],'seconds')
+            bar(f'19_{slug}_policy_throughput.svg','Synthetic policy throughput - '+scenario,lab,[('Jobs/s',[x.get('throughput_jobs_per_s') for x in rows])],'jobs/s')
+    if d['policy_trials']:
+        rows=d['policy_trials'];by=defaultdict(list)
+        for r in rows:by[r.get('policy','')].append(r)
+        policies=sorted(by)
+        bar('23_synthetic_trial_variability.svg','Synthetic trial-to-trial p95 queue spread',policies,[('Mean p95 s',[avg([x.get('p95_wait_s') for x in by[k]]) for k in policies]),('Max p95 s',[max([x.get('p95_wait_s') or 0 for x in by[k]],default=None) for k in policies])],'seconds','Grouped across scenarios; raw policies may behave differently per workload')
+    if d['policy_jobs']:
+        rows=d['policy_jobs'];by=defaultdict(list)
+        for r in rows:by[r.get('policy','')].append(r)
+        policies=sorted(by)
+        bar('24_synthetic_job_wait.svg','Synthetic per-job mean queue wait across policies',policies,[('Mean queue wait s',[avg([x.get('queue_wait_s') for x in by[k]]) for k in policies])],'seconds','Synthetic scheduling-policy job records; no actual GPU service time')
+    if d['workers']:
+        # Chart the first worker watch session across polling rows
+        groups=defaultdict(list)
+        for r in d['workers']:groups[r.get('run_id')].append(r)
+        k,rows=max(groups.items(),key=lambda t:len(t[1]));by=defaultdict(list)
+        for r in rows:by[r.get('at')].append(r)
+        times=sorted(by)
+        line('25_worker_health_samples.svg','Simulated worker watch: healthy workers',list(range(1,len(times)+1)),[('Healthy',[sum(x.get('health')=='healthy' for x in by[t]) for t in times])],'workers','Operational heartbeat snapshots in CPU simulation')
+        line('26_worker_active_jobs.svg','Simulated worker watch: active jobs',list(range(1,len(times)+1)),[('Active jobs',[sum(x.get('active_jobs') or 0 for x in by[t]) for t in times])],'jobs')
+    telemetry=d['telemetry']
+    if telemetry:
+        gg=defaultdict(list)
+        for x in telemetry:gg[x['run_id']].append(x)
+        rid,rows=max(gg.items(),key=lambda t:len(t[1]));rows=sorted(rows,key=lambda x:x.get('polled_utc') or '')[:120]
+        labels=[str(i+1) for i in range(len(rows))]
+        line('20_telemetry_hbm.svg',f'Sampled MI300X HBM usage: {rid}',labels,[('HBM GiB',[x.get('hbm_used_gib') for x in rows])],'GiB','Polled snapshots, not continuous maximum')
+        line('21_telemetry_util.svg',f'Sampled MI300X utilization: {rid}',labels,[('Utilization %',[x.get('gpu_util_percent') for x in rows])],'%')
+        line('22_telemetry_jobs.svg',f'Sampled queue / running jobs: {rid}',labels,[('Running',[x.get('cluster_running_jobs') for x in rows]),('Queued',[x.get('cluster_queued_jobs') for x in rows])],'jobs')
+    return catalog
+
+def build_html(output,d,catalog,comparisons):
+    runs=d['runs'];q=d['quality'];p=d['policy'];event=d['events'];profiles=d['profiles']
+    vals=[r.get('requested_jobs') for r in runs if r.get('evidence_type') in ('real_v2','real_legacy','documented_real_summary')]
+    count=sum(1 for r in runs if r.get('evidence_type') in ('real_v2','real_legacy','documented_real_summary'))
+    nf=len(catalog)
+    html='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AMD AI Factory - Benchmark Atlas</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}header{padding:38px max(24px,calc((100vw - 1280px)/2));background:linear-gradient(125deg,#102844,#0c1527 70%);border-bottom:1px solid #26394b}h1{font-size:38px;margin:2px 0}h2{font-size:24px;margin:34px 0 18px}p{color:#a5b4c7}main{max-width:1320px;margin:auto;padding:10px 24px 80px}.eyebrow{letter-spacing:2px;color:#86e5dd;font-weight:700}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.kpi,.panel{background:#141e2e;border:1px solid #28374c;border-radius:12px;padding:19px}.kpi strong{display:block;font-size:29px;color:#effafc}.kpi small{color:#9cb1c7}.banner{padding:17px;background:#16342e;border:1px solid #236659;border-radius:10px;margin:22px 0;color:#cef5e2}.warn{background:#352b18;border-color:#605027;color:#f3ddb0}.graphs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,550px),1fr));gap:17px}.graphs figure{margin:0;background:#111927;border:1px solid #263448;border-radius:13px;overflow:hidden}.graphs img{display:block;width:100%;height:auto}.graphs figcaption{padding:6px 18px 15px;font-weight:600}.table-wrap{overflow:auto;border:1px solid #27364a;border-radius:10px;max-height:650px}table{border-collapse:collapse;min-width:100%;font-size:12px}th{position:sticky;top:0;background:#233349;text-transform:none;color:#d9eef4;z-index:2}td,th{border-bottom:1px solid #263548;padding:9px 12px;text-align:left;white-space:nowrap}tbody tr:nth-child(even){background:#131e2b}tbody tr:hover{background:#1d3245}.filters{display:flex;gap:12px;align-items:center;margin-bottom:12px}input{background:#17263a;border:1px solid #39516a;color:#fff;padding:11px 15px;border-radius:8px;width:min(600px,100%)}a{color:#68c9f5;text-decoration:none}.muted{color:#91a5ba}footer{margin-top:40px;color:#8da2ba;font-size:12px}
+</style></head><body><header><div class="eyebrow">AMD AI FACTORY MISSION CONTROL / BENCHMARK INTELLIGENCE</div><h1>Benchmark Atlas</h1><p>Offline, evidence-indexed analysis of real MI300X inference, synthetic scheduling, and reliability tests.</p></header><main>'''
+    html+=f'<div class="banner">Source mode: <b>{"Documented preview" if any(x.get("evidence_type")=="documented_real_summary" for x in runs) else "Local raw evidence"}</b>. Charts never infer physical multi-GPU scaling from one serving endpoint. Output contains no prompts, generated text or credentials.</div>'
+    html+='<div class="grid">'
+    for name,value,desc in [('GPU benchmark runs',count,'Real v2 and legacy or documented summaries'),('Real job rows',len(d['jobs']),'Sanitized per-job timing records'),('Synthetic policy rows',len(p),'Scenario × policy aggregates'),('Synthetic job rows',len(d['policy_jobs']),'CPU simulation, not MI300X inference'),('Generated charts',nf,'SVG, editable vector graphics'),('Profiler trial rows',len(profiles),'Windows/network-inclusive client timings'),('Other evidence records',len(event),'Reliability, restart, security, monitoring')]:
+        html+=f'<div class="kpi"><small>{escape(name)}</small><strong>{value}</strong><small>{escape(desc)}</small></div>'
+    html+='</div><h2>Performance graphs</h2><div class="graphs">'
+    for file,title in catalog:html+=f'<figure><img loading="lazy" alt="{escape(title)}" src="figures/{escape(file)}"><figcaption>{escape(title)}</figcaption></figure>'
+    html+='</div><h2>Real GPU benchmark run index</h2><div class="filters"><input id="filter" oninput="filterRows()" placeholder="Filter run ID, mode, model, source or metric..."></div><div id="run-index">'
+    show_cols=['run_id','evidence_type','requested_jobs','completed','failed','p95_queue_wait_seconds','p95_end_to_end_seconds','observed_client_tokens_per_second','gpu_poll_rows','relative_source']
+    html+=html_table(runs,show_cols,2000)+'</div>'
+    if comparisons:html+='<h2>Same-job/model adjacent-run comparisons</h2><p>Descriptive changes only. Matching the number of requests and model does not establish identical hardware state or configurations.</p>'+html_table(comparisons,list(comparisons[0]),500)
+    if p:html+='<h2>Synthetic scheduling policies</h2><p>Derived from CPU discrete-event simulation. Not comparable to MI300X hardware throughput.</p>'+html_table(p,['run_id','scenario','policy','p95_wait_s','deadline_met_pct','tenant_mean_wait_gap_s','throughput_jobs_per_s'],200)
+    if event:html+='<h2>Reliability, security and monitoring evidence</h2>'+html_table(event,COLUMNS_EVENTS,300)
+    if q:html+='<h2>Data quality and limitations</h2>'+html_table(q,['source','level','issue'],300)
+    html+='''<h2>Interpretation rules</h2><div class="panel"><p>• p95/p99 calculated from few jobs are descriptive sample quantiles, not production guarantees.<br>
+• Legacy 4-job throughput uses the original script's makespan denominator and is not directly comparable to v2 client-observed throughput.<br>
+• GPU telemetry contains snapshots only; observed HBM is not a complete peak consumption measurement.<br>
+• Scheduler Lab runs synthetic service times and deliberately excludes real GPU/network/agent overhead.<br>
+• One MI300X serving endpoint cannot validate cross-GPU placement, and controller restart checks do not prove exactly-once physical execution.<br>
+• For research claims, keep raw evidence and repeat controlled runs across the same configuration.</p></div><footer>Local-only report. Source CSV indexes stored in the adjacent /tables directory. No telemetry was transmitted externally.</footer></main><script>
+function filterRows(){let q=document.getElementById('filter').value.toLowerCase();document.querySelectorAll('#run-index tbody tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}
+</script></body></html>'''
+    (output/'index.html').write_text(html,encoding='utf-8')
+
+def run(args):
+    project=Path(args.project).expanduser().resolve()
+    output=(Path(args.output).expanduser() if args.output else project/'results'/'benchmark-atlas').resolve()
+    if output==project or output in [project/'results'/'mi300x',project/'results'/'scheduler-lab']:
+        raise SystemExit('Refusing to write into source evidence directory.')
+    output.mkdir(parents=True,exist_ok=True)
+    d=collect(project,examples=args.sample)
+    # Report all machine-discovered source files in relevant evidence trees, with no file contents copied.
+    for base in (project/'results'/'mi300x',project/'results'/'scheduler-lab',project/'results'/'reliability',project/'results'/'hardening',project/'results'/'monitoring'):
+        if not base.is_dir():continue
+        for path in sorted(base.rglob('*')):
+            if not path.is_file() or path.suffix.lower() not in ('.csv','.json'):continue
+            d['files'].append({'kind':'raw_archive','run_id':path.parent.name,'relative_source':str(path.relative_to(project)),
+                'size_bytes':path.stat().st_size})
+    cmp=compare_runs(d['runs'])
+    tables=output/'tables'
+    indices=[('runs_index.csv',COLUMNS_RUN,d['runs']),('jobs_index.csv',COLUMNS_JOB,d['jobs']),
+       ('telemetry_index.csv',COLUMNS_TEL,d['telemetry']),('profiler_index.csv',COLUMNS_PROF,d['profiles']),
+       ('scheduler_policy_index.csv',COLUMNS_POLICY,d['policy']),('reliability_security_index.csv',COLUMNS_EVENTS,d['events']),
+       ('evidence_files_index.csv',['kind','run_id','relative_source','size_bytes'],d['files']),
+       ('data_quality_index.csv',['source','level','issue'],d['quality']),
+       ('scheduler_trials_index.csv',COLUMNS_POLICY_TRIAL,d['policy_trials']),
+       ('scheduler_jobs_index.csv',COLUMNS_POLICY_JOB,d['policy_jobs']),
+       ('worker_health_samples_index.csv',COLUMNS_WORKER,d['workers']),
+       ('matched_run_comparisons.csv',['jobs','model','run_before','run_after','p95_e2e_before_s','p95_e2e_after_s','p95_e2e_reduction_pct','p95_queue_reduction_pct','client_throughput_change_pct','comparison_validity'],cmp),
+       ('metric_dictionary.csv',['key','label','unit'],[dict(zip(('key','label','unit'),x)) for x in FIELDS])]
+    for fn,cols,rows in indices:write_csv(tables/fn,cols,rows)
+    figs=render_graphs(output,d)
+    build_html(output,d,figs,cmp)
+    summary={'generated_at_utc':datetime.now(timezone.utc).isoformat(),'project_root':str(project),
+     'sample_mode':args.sample,'real_runs':sum(x['evidence_type'] in ('real_v2','real_legacy','documented_real_summary') for x in d['runs']),
+     'sanitized_real_jobs':len(d['jobs']),'telemetry_poll_rows':len(d['telemetry']),
+     'profiler_trials':len(d['profiles']),'policy_aggregate_rows':len(d['policy']),'policy_trial_rows':len(d['policy_trials']),'synthetic_policy_job_rows':len(d['policy_jobs']),'worker_health_sample_rows':len(d['workers']),
+     'operational_evidence_records':len(d['events']),'graph_count':len(figs),
+     'index_csv_count':len(indices),'warnings':d['quality'],
+     'security':'Read-only; does not copy prompt/output/auth fields; no network requests'}
+    (output/'atlas_manifest.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+    print(json.dumps({k:v for k,v in summary.items() if k!='warnings'},indent=2))
+    print('Open: '+str(output/'index.html'))
+    return 0
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser(description='Generate all local AMD AI Factory benchmark indices and SVG charts; offline and read-only')
+    ap.add_argument('--project',default='.',help='Path to your amd-ai-factory project')
+    ap.add_argument('--output',default=None,help='Default: <project>/results/benchmark-atlas')
+    ap.add_argument('--sample',action='store_true',help='Include documented four-run sample summary when run without raw results; for preview only')
+    raise SystemExit(run(ap.parse_args()))
