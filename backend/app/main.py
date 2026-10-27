@@ -388,18 +388,33 @@ def update_metrics():
     RUNNING.set(sum(n['active_jobs'] for n in nodes))
 
 
-async def worker_loop():
+async def discovery_loop():
+    """Refresh real endpoint and GPU telemetry without delaying queued jobs."""
     while True:
         try:
             await live.refresh()
+            update_metrics()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f'agent discovery error: {exc}', flush=True)
+        await asyncio.sleep(1.5)
+
+
+async def worker_loop():
+    """Dispatch queued work independently of remote GPU agent polling."""
+    while True:
+        try:
             if get_mode() == 'simulation':
                 sim_tick()
             else:
                 real_tick()
-            update_metrics()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             print(f'worker loop error: {exc}', flush=True)
-        await asyncio.sleep(1.5)
+        # Fast only while queued work exists; idle mode uses a relaxed cadence.
+        await asyncio.sleep(0.25 if pending_count() else 0.5)
 
 
 @asynccontextmanager
@@ -436,15 +451,17 @@ async def lifespan(app: FastAPI):
             cache.lpush(queue_names[job.priority], job.id)
     await live.refresh()
     task = asyncio.create_task(worker_loop())
+    telemetry_task = asyncio.create_task(discovery_loop())
     try:
         yield
     finally:
         task.cancel()
+        telemetry_task.cancel()
         if loadtest_task:
             loadtest_task.cancel()
         for real in list(active_tasks):
             real.cancel()
-        await asyncio.gather(task, *list(active_tasks), *([loadtest_task] if loadtest_task else []), return_exceptions=True)
+        await asyncio.gather(task, telemetry_task, *list(active_tasks), *([loadtest_task] if loadtest_task else []), return_exceptions=True)
 
 
 app = FastAPI(title='AMD AI Factory Mission Control', version='0.3.0', lifespan=lifespan)
